@@ -111,6 +111,55 @@ RUN git clone --depth 1 --quiet https://github.com/opendatahub-io/skills-registr
 All skills are flat in one directory — no plugin namespacing. OpenCode
 discovers them by scanning for `SKILL.md` files.
 
+Two consequences follow from that flat layout. A skill name that another
+plugin already claims is a destination collision, and the colliding plugin is
+skipped whole rather than skill by skill, so prefixing skill names keeps a
+plugin installable. And a plugin whose skills share code cannot keep that code
+above them, because only the skill directories are copied and symlinks into a
+parent are dropped. Declaring the shared paths is how a plugin brings them
+along.
+
+### Shared code between skills
+
+A skill declares the trees it needs in its frontmatter, as paths relative to
+the plugin source root:
+
+```yaml
+---
+name: docs-write
+description: Generate documentation for a code module.
+metadata:
+  x-shared-paths: lib prompts schemas
+---
+```
+
+Each declared path is copied to the same relative path inside the installed
+skill, so `lib/run/step.py` in the source repository arrives at
+`~/.config/opencode/skills/docs-write/lib/run/step.py`. A script can then reach
+it by walking up from `__file__`, and the same walk finds the repository copy
+during development.
+
+```text
+~/.config/opencode/skills/
+  docs-write/
+    SKILL.md
+    scripts/write.py
+    lib/run/step.py       # brought along, one copy per declaring skill
+    prompts/
+    schemas/
+```
+
+The source repository keeps one copy. Every skill that declares the path gets
+one, which is what makes the tree available without the plugin vendoring copies
+into its own git history.
+
+Paths are refused when they escape the source root, when they are absolute,
+when they are symlinks, and when the skill already ships a file or directory at
+that destination. A missing path warns and the install continues.
+
+The `x-` prefix follows the convention for extension fields, so an official
+`shared-paths` key with different semantics would not collide with this one.
+
 ## Codex: native plugins with legacy compatibility
 
 Codex has a native plugin and marketplace system. At build time,

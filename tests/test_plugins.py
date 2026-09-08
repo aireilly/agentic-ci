@@ -9,6 +9,7 @@ import pytest
 
 from agentic_ci.plugins import (
     _codex_marketplace_root,
+    _copy_shared_paths,
     _filter_codex,
     _find_skill_names,
     _run_codex_json,
@@ -878,3 +879,176 @@ def test_run_codex_json_reports_stderr(capsys):
     output = capsys.readouterr().out
     assert "exit 2" in output
     assert "plugin registry unavailable" in output
+
+
+# -- shared paths ------------------------------------------------------------
+
+
+class TestSharedPaths:
+    """``metadata.x-shared-paths`` brings a plugin's shared tree along.
+
+    Skills install one directory at a time, so code shared between several of
+    them is left behind and a symlink into it is dropped. Declaring the paths
+    keeps one copy in the source repository instead of one per skill.
+    """
+
+    def _make_repo(self, tmp_path, shared="lib", extra_skill_body=""):
+        repo = tmp_path / "mock-repo"
+        lib = repo / "lib" / "run"
+        lib.mkdir(parents=True)
+        (lib / "step.py").write_text("SHARED = 1\n")
+        (repo / "lib" / "__init__.py").write_text("")
+        (repo / "prompts").mkdir()
+        (repo / "prompts" / "write.md").write_text("prompt\n")
+
+        skill = repo / "skills" / "writer"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\n"
+            "name: writer\n"
+            "metadata:\n"
+            f"  x-shared-paths: {shared}\n"
+            "---\n"
+            f"Body\n{extra_skill_body}"
+        )
+        (skill / "scripts").mkdir()
+        (skill / "scripts" / "write.py").write_text("import lib.run.step\n")
+        return repo
+
+    def _marketplace(self, tmp_path):
+        mkt = tmp_path / "marketplace.json"
+        mkt.write_text(
+            json.dumps(
+                {
+                    "name": "test-mkt",
+                    "plugins": [
+                        {
+                            "name": "mock-writer",
+                            "version": "1.0.0",
+                            "source": {"repo": "fake/mock", "ref": "main"},
+                        }
+                    ],
+                }
+            )
+        )
+        return mkt
+
+    def _install(self, tmp_path, repo):
+        mkt = self._marketplace(tmp_path)
+        skills_dir = tmp_path / "skills"
+        manifest = tmp_path / "manifest.json"
+
+        def fake_clone(url, dest, branch=None, depth=None):
+            shutil.copytree(repo, dest)
+            return True
+
+        with mock.patch("agentic_ci.plugins.clone_repo", side_effect=fake_clone):
+            install_opencode_skills(mkt, skills_dir=skills_dir, manifest_path=manifest)
+        return skills_dir
+
+    def test_declared_tree_lands_beside_the_skill(self, tmp_path):
+        repo = self._make_repo(tmp_path, shared="lib prompts")
+        skills_dir = self._install(tmp_path, repo)
+
+        assert (skills_dir / "writer" / "SKILL.md").is_file()
+        assert (skills_dir / "writer" / "lib" / "run" / "step.py").is_file()
+        assert (skills_dir / "writer" / "prompts" / "write.md").is_file()
+
+    def test_relative_path_is_preserved(self, tmp_path):
+        """A script reaches the tree the same way installed and in a checkout."""
+        repo = tmp_path / "mock-repo"
+        nested = repo / "shared" / "lib"
+        nested.mkdir(parents=True)
+        (nested / "step.py").write_text("SHARED = 1\n")
+        skill = repo / "skills" / "writer"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: writer\nmetadata:\n  x-shared-paths: shared/lib\n---\nBody\n"
+        )
+
+        skills_dir = self._install(tmp_path, repo)
+        assert (skills_dir / "writer" / "shared" / "lib" / "step.py").is_file()
+
+    def test_a_single_file_is_copied(self, tmp_path):
+        repo = self._make_repo(tmp_path, shared="prompts/write.md")
+        skills_dir = self._install(tmp_path, repo)
+        assert (skills_dir / "writer" / "prompts" / "write.md").is_file()
+        assert not (skills_dir / "writer" / "lib").exists()
+
+    def test_no_declaration_copies_nothing_extra(self, tmp_path):
+        repo = tmp_path / "mock-repo"
+        (repo / "lib").mkdir(parents=True)
+        (repo / "lib" / "step.py").write_text("SHARED = 1\n")
+        skill = repo / "skills" / "writer"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: writer\n---\nBody\n")
+
+        skills_dir = self._install(tmp_path, repo)
+        assert (skills_dir / "writer" / "SKILL.md").is_file()
+        assert not (skills_dir / "writer" / "lib").exists()
+
+    def test_path_escaping_the_repository_is_rejected(self, tmp_path):
+        secret = tmp_path / "outside"
+        secret.mkdir()
+        (secret / "secret.txt").write_text("do not copy me\n")
+
+        repo = self._make_repo(tmp_path, shared="../outside")
+        skills_dir = self._install(tmp_path, repo)
+
+        assert not (skills_dir / "writer" / "outside").exists()
+        assert not list(skills_dir.rglob("secret.txt"))
+
+    def test_absolute_path_is_rejected(self, tmp_path):
+        repo = self._make_repo(tmp_path, shared="/etc")
+        skills_dir = self._install(tmp_path, repo)
+        assert not (skills_dir / "writer" / "etc").exists()
+
+    def test_missing_path_warns_and_continues(self, tmp_path, capsys):
+        repo = self._make_repo(tmp_path, shared="lib nope")
+        skills_dir = self._install(tmp_path, repo)
+
+        assert (skills_dir / "writer" / "lib" / "run" / "step.py").is_file()
+        assert "shared path not found: nope" in capsys.readouterr().out
+
+    def test_skill_content_is_never_overwritten(self, tmp_path, capsys):
+        repo = self._make_repo(tmp_path, shared="lib")
+        own = repo / "skills" / "writer" / "lib"
+        own.mkdir()
+        (own / "mine.py").write_text("OWN = 1\n")
+
+        skills_dir = self._install(tmp_path, repo)
+
+        assert (skills_dir / "writer" / "lib" / "mine.py").read_text() == "OWN = 1\n"
+        assert not (skills_dir / "writer" / "lib" / "run").exists()
+        assert "already ships lib" in capsys.readouterr().out
+
+    def test_symlinked_shared_path_is_skipped(self, tmp_path, capsys):
+        """A link is refused for the same reason `_copy_tree` refuses one.
+
+        Exercised against `_copy_shared_paths` directly: the fake clone these
+        tests use dereferences links on the way in, so the link would not
+        survive to reach the installer.
+        """
+        repo = self._make_repo(tmp_path, shared="linked")
+        (repo / "linked").symlink_to(repo / "lib", target_is_directory=True)
+        dest = tmp_path / "installed-writer"
+        dest.mkdir()
+
+        copied = _copy_shared_paths(repo / "skills" / "writer", repo, dest)
+
+        assert copied == []
+        assert not (dest / "linked").exists()
+        assert "skipping symlinked shared path" in capsys.readouterr().out
+
+    def test_every_skill_declaring_the_tree_gets_it(self, tmp_path):
+        """One copy in the repository, one copy per installed skill."""
+        repo = self._make_repo(tmp_path, shared="lib")
+        second = repo / "skills" / "reviewer"
+        second.mkdir(parents=True)
+        (second / "SKILL.md").write_text(
+            "---\nname: reviewer\nmetadata:\n  x-shared-paths: lib\n---\nBody\n"
+        )
+
+        skills_dir = self._install(tmp_path, repo)
+        assert (skills_dir / "writer" / "lib" / "run" / "step.py").is_file()
+        assert (skills_dir / "reviewer" / "lib" / "run" / "step.py").is_file()

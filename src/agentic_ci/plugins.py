@@ -31,6 +31,7 @@ import tempfile
 from pathlib import Path
 
 from agentic_ci.git import clone_repo
+from agentic_ci.skill_metadata import load_skill_metadata
 
 DEFAULT_MANIFEST_PATH = "/usr/local/share/agentic-ci/plugin-skills.manifest.json"
 
@@ -75,6 +76,76 @@ def _copy_tree(src: Path, dest: Path) -> None:
             _copy_tree(item, target)
         else:
             shutil.copy2(item, target)
+
+
+def _copy_shared_paths(skill_dir: Path, source_root: Path, dest: Path) -> list[str]:
+    """Copy the trees a skill declares in ``metadata.x-shared-paths``.
+
+    Skills are installed one directory at a time, so code shared between
+    several of them has nowhere to live: a tree above the skills is left
+    behind, and a symlink into it is dropped by :func:`_copy_tree`. Declaring
+    the paths lets the installer bring them along, which keeps one copy in the
+    source repository instead of one per skill.
+
+    Each path is relative to the plugin source root and lands at the same
+    relative path inside the installed skill, so a script can reach it the same
+    way in a checkout and after an install. Paths escaping the source root are
+    rejected, and a path that would overwrite something the skill already ships
+    is skipped rather than clobbering it.
+
+    Returns the paths that were copied.
+    """
+    try:
+        metadata = load_skill_metadata(skill_dir / "SKILL.md")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"  WARN: cannot read {skill_dir / 'SKILL.md'}: {exc}")
+        return []
+
+    copied: list[str] = []
+    for raw in metadata.shared_paths:
+        rel = raw.removeprefix("./")
+        if not rel or Path(rel).is_absolute():
+            print(f"  WARN: rejected absolute shared path: {raw}")
+            continue
+
+        declared = source_root / rel
+        # Test for a link before resolving, because resolving follows it and
+        # `_copy_tree` refuses links for the same reason: a declared path is
+        # allowed to name a tree in the repository, never a way out of it.
+        if declared.is_symlink():
+            print(f"  WARN: skipping symlinked shared path: {raw}")
+            continue
+
+        candidate = declared.resolve()
+        try:
+            candidate.relative_to(source_root.resolve())
+        except ValueError:
+            print(f"  WARN: rejected shared path outside repository: {raw}")
+            continue
+        if not candidate.exists():
+            print(f"  WARN: shared path not found: {raw}")
+            continue
+
+        target = (dest / rel).resolve()
+        try:
+            target.relative_to(dest.resolve())
+        except ValueError:
+            print(f"  WARN: rejected shared path destination outside skill: {raw}")
+            continue
+        if target.exists():
+            print(f"  WARN: {skill_dir.name} already ships {rel}; leaving it alone")
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if candidate.is_dir():
+            _copy_tree(candidate, target)
+        else:
+            shutil.copy2(candidate, target)
+        copied.append(rel)
+
+    if copied:
+        print(f"  {skill_dir.name}: brought along {', '.join(copied)}")
+    return copied
 
 
 def _check_unmatched(wanted: set[str], matched: set[str]) -> None:
@@ -250,7 +321,9 @@ def install_opencode_skills(
                 continue
 
             for skill_name, skill_dir in skill_dirs.items():
-                _copy_tree(skill_dir, skills_dir / skill_name)
+                destination = skills_dir / skill_name
+                _copy_tree(skill_dir, destination)
+                _copy_shared_paths(skill_dir, source_root, destination)
             if skill_dirs:
                 manifest[name] = sorted(skill_dirs)
 

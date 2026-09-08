@@ -20,6 +20,12 @@ _NESTED_KV_RE = re.compile(r"^\s+([a-z][a-z0-9-]*)\s*:\s*(.*)", re.IGNORECASE)
 # adds an official "artifacts" key with different semantics.
 _METADATA_ARTIFACTS_KEY = "x-artifacts"
 
+# Paths, relative to the plugin source root, that a skill needs alongside it.
+# Installers that copy one skill directory at a time leave a shared tree behind;
+# declaring it here lets the installer bring it along instead of every skill
+# vendoring its own copy.
+_METADATA_SHARED_PATHS_KEY = "x-shared-paths"
+
 
 def _strip_quotes(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
@@ -100,6 +106,7 @@ class SkillMetadata:
     user_invocable: bool = False
     metadata: dict[str, str] = field(default_factory=dict)
     artifacts: list[str] = field(default_factory=list)
+    shared_paths: list[str] = field(default_factory=list)
 
 
 def load_skill_metadata(skill_md_path: Path) -> SkillMetadata:
@@ -125,6 +132,9 @@ def load_skill_metadata(skill_md_path: Path) -> SkillMetadata:
     artifacts_str = metadata.get(_METADATA_ARTIFACTS_KEY, "")
     artifacts = artifacts_str.split() if artifacts_str else []
 
+    shared_str = metadata.get(_METADATA_SHARED_PATHS_KEY, "")
+    shared_paths = shared_str.split() if shared_str else []
+
     description = data.get("description", "")
     if not isinstance(description, str):
         description = ""
@@ -136,6 +146,7 @@ def load_skill_metadata(skill_md_path: Path) -> SkillMetadata:
         user_invocable=user_invocable,
         metadata=metadata,
         artifacts=artifacts,
+        shared_paths=shared_paths,
     )
 
 
